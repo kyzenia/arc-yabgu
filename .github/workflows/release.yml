@@ -20,13 +20,11 @@ jobs:
             out: yabgu-linux-x86_64
             cc: gcc
             flags: -O2 -s -static -Wall -Wextra
-
-          # Add Windows here when ready:
-          # - os: windows-latest
-          #   target: windows-x86_64
-          #   out: yabgu-windows-x86_64.exe
-          #   cc: gcc
-          #   flags: -O2 -s -Wall -Wextra
+          - os: windows-latest
+            target: windows-x86_64
+            out: yabgu-windows-x86_64.exe
+            cc: gcc
+            flags: -O2 -s -Wall -Wextra
 
     runs-on: ${{ matrix.os }}
 

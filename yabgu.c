@@ -7,13 +7,89 @@
 #include <string.h>
 #include <errno.h>
 
+#ifdef _WIN32
+#include <windows.h>
+
+static UINT oldInCP, oldOutCP;
+
+static void restoreConsole(void) {
+    SetConsoleCP(oldInCP);
+    SetConsoleOutputCP(oldOutCP);
+}
+
+static void initConsole(void) {
+    oldInCP = GetConsoleCP();
+    oldOutCP = GetConsoleOutputCP();
+    SetConsoleCP(CP_UTF8);
+    SetConsoleOutputCP(CP_UTF8);
+    atexit(restoreConsole);
+}
+
+static wchar_t *toWide(const char *s) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+    if (n <= 0) return NULL;
+    wchar_t *w = malloc(n * sizeof(wchar_t));
+    if (w && MultiByteToWideChar(CP_UTF8, 0, s, -1, w, n) <= 0) {
+        free(w);
+        return NULL;
+    }
+    return w;
+}
+
+static FILE *openFile(const char *name, const char *mode) {
+    wchar_t *wName = toWide(name);
+    wchar_t *wMode = toWide(mode);
+    FILE *f = NULL;
+    if (wName && wMode) f = _wfopen(wName, wMode);
+    free(wName);
+    free(wMode);
+    return f;
+}
+
+static int removeFile(const char *name) {
+    wchar_t *w = toWide(name);
+    if (!w) { errno = EINVAL; return -1; }
+    int r = _wremove(w);
+    free(w);
+    return r;
+}
+
+static char *readLine(char *buf, size_t size) {
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode;
+    if (!GetConsoleMode(h, &mode)) return fgets(buf, (int)size, stdin);   // piped input
+
+    wchar_t w[4096];
+    DWORD got = 0;
+    if (!ReadConsoleW(h, w, 4095, &got, NULL) || got == 0) return NULL;
+
+    while (got > 0 && (w[got - 1] == L'\r' || w[got - 1] == L'\n')) got--;
+
+    int n = 0;
+    if (got > 0) {
+        n = WideCharToMultiByte(CP_UTF8, 0, w, (int)got, buf, (int)size - 2, NULL, NULL);
+        if (n <= 0) n = 0;
+    }
+    buf[n] = '\n';
+    buf[n + 1] = '\0';
+    return buf;
+}
+#else
+#define initConsole() ((void)0)
+#define openFile fopen
+#define removeFile remove
+#define readLine(b, s) fgets((b), (int)(s), stdin)
+#endif
+
 #define DATA_CHUNKS (8 * 1024 * 1024)
+#define MAX_KEY_DIGITS 4000
+
 char userFile[4096];
 
 int getUserChoice(void);
 void getUserFile(char userFile[], size_t size);
 long long getUserSeed(void);
-long long getUserKey(void);
+size_t getUserKey(unsigned char key[]);
 void checkOverflow(void);
 
 typedef struct abGen {
@@ -32,16 +108,15 @@ Tables decryptTableGen(abGen ab);
 
 int cryptFile(unsigned char tables[10][256], const unsigned char key[], size_t lenKey,
               const char inName[], const char outName[]);
-            
-size_t keyToDigits(long long userKey, unsigned char digits[20]);
 
 void pressEnter(void);
 void credits(void);
 
 int main(void) {
+    initConsole();
     printf("\n_________________________________________________________");
     printf("\n                                                         ");
-    printf("\n                        Yabgu v1.0                       ");
+    printf("\n                        Yabgu v2.0                       ");
     printf("\n                                                         ");
     printf("\n    Please select among available options below (1-3):   ");
     printf("\n                                                         ");
@@ -73,7 +148,7 @@ int main(void) {
         snprintf(outFile, sizeof(outFile), "%.*s", (int)(len - sfx), userFile);
     }
 
-    FILE *test = fopen(outFile, "rb");
+    FILE *test = openFile(outFile, "rb");
     if (test) {
         fclose(test);
         printf("\n\"%s\" already exists. Move or rename it first.\n", outFile);
@@ -83,8 +158,8 @@ int main(void) {
     }
 
     long long userSeed = getUserSeed();
-    unsigned char key[20];
-    size_t lenKey = keyToDigits(getUserKey(), key);
+    unsigned char key[MAX_KEY_DIGITS];
+    size_t lenKey = getUserKey(key);
 
     abGen ab = alfaBetaGen(userSeed);
     Tables t = (userChoice == 1) ? encryptTableGen(ab) : decryptTableGen(ab);
@@ -93,7 +168,7 @@ int main(void) {
 
     if (ok) {
         int removeErr = 0;
-        if (remove(userFile) != 0) removeErr = errno;
+        if (removeFile(userFile) != 0) removeErr = errno;
 
         printf("\n%s complete. Please check \"%s\"\n",
                 userChoice == 1 ? "Encryption" : "Decryption", outFile);
@@ -104,7 +179,7 @@ int main(void) {
             printf("\nPlease delete it manually.\n");
         }
     } else {
-        remove(outFile);
+        removeFile(outFile);
         printf("\nThere has been a problem while %s. Operation aborted.\n",
                userChoice == 1 ? "encrypting" : "decrypting");
     }
@@ -140,7 +215,7 @@ void getUserFile(char userFile[], size_t size) {
     do {
         while (1) {
             printf("Enter your file's full name: ");
-            if (fgets(userFile, size, stdin) == NULL) exit(1);
+            if (readLine(userFile, size) == NULL) exit(1);
             if (strchr(userFile, '\n') == NULL) {
                 checkOverflow();
                 continue;
@@ -150,7 +225,7 @@ void getUserFile(char userFile[], size_t size) {
             break;
         }
     
-        FILE *file = fopen(userFile, "rb");
+        FILE *file = openFile(userFile, "rb");
         if (file) {
             fclose(file);
             escape = 0;
@@ -182,21 +257,27 @@ long long getUserSeed(void) {
     }
 }
 
-long long getUserKey(void) {
-    char buffer[64];
-    char *endPtr;
+size_t getUserKey(unsigned char key[]) {
+    char buffer[MAX_KEY_DIGITS + 2];
 
     while (1) {
-        printf("Enter your key (positive integer): ");
+        printf("Enter your key (integer): ");
         if (fgets(buffer, sizeof(buffer), stdin) == NULL) exit(1);
-        if (strchr(buffer, '\n') == NULL) {
+
+        char *newline = strchr(buffer, '\n');
+        if (newline == NULL) {
             checkOverflow();
             continue;
         }
-        errno = 0;
-        long long userKey = strtoll(buffer, &endPtr, 10);
-        if (endPtr != buffer && *endPtr == '\n' && errno == 0) {
-            return userKey;
+        *newline = '\0';
+
+        size_t len = strlen(buffer);
+        size_t i = 0;
+        while (i < len && buffer[i] >= '0' && buffer[i] <= '9') i++;
+
+        if (len > 0 && i == len) {
+            for (i = 0; i < len; i++) key[i] = buffer[i] - '0';
+            return len;
         }
         printf("\nIt can't be that hard to enter a valid key...\n\n");
     }
@@ -239,7 +320,7 @@ abGen alfaBetaGen(long long userSeed) {
 
     uint64_t state = (uint64_t)userSeed;
 
-    for (int i = 1; i < 10; i++) {
+    for (int i = 0; i < 10; i++) {
         shuffle(ab.alfaBetas[i], 256, &state);
         for (int j = 0; j < 256; j++) {
             ab.revAlfaBetas[i][ab.alfaBetas[i][j]] = j;
@@ -251,11 +332,10 @@ abGen alfaBetaGen(long long userSeed) {
 
 Tables encryptTableGen(abGen ab) {
     Tables enc;
-    unsigned char *ab0 = ab.alfaBetas[0];
 
     for (int i = 0; i < 10; i++) {
         for (int byte = 0; byte < 256; byte++) {
-            enc.tables[i][byte] = ab.revAlfaBetas[i][ab0[byte]];
+            enc.tables[i][byte] = ab.alfaBetas[i][byte];
         }
     }
 
@@ -264,11 +344,10 @@ Tables encryptTableGen(abGen ab) {
 
 Tables decryptTableGen(abGen ab) {
     Tables dec;
-    unsigned char *revAB0 = ab.revAlfaBetas[0];
 
     for (int i = 0; i < 10; i++) {
         for (int byte = 0; byte < 256; byte++) {
-            dec.tables[i][byte] = revAB0[ab.alfaBetas[i][byte]];
+            dec.tables[i][byte] = ab.revAlfaBetas[i][byte];
         }
     }
 
@@ -277,10 +356,10 @@ Tables decryptTableGen(abGen ab) {
 
 int cryptFile(unsigned char tables[10][256], const unsigned char key[], size_t lenKey,
               const char inName[], const char outName[]) {
-    FILE *in = fopen(inName, "rb");
+    FILE *in = openFile(inName, "rb");
     if (!in) return 0;
 
-    FILE *out = fopen(outName, "wb");
+    FILE *out = openFile(outName, "wb");
     unsigned char *buf = malloc(DATA_CHUNKS);
     if (!out || !buf) {
         fclose(in);
@@ -308,21 +387,6 @@ int cryptFile(unsigned char tables[10][256], const unsigned char key[], size_t l
     fclose(in);
     if (fclose(out) != 0) ok = 0;
     return ok;
-}
-
-size_t keyToDigits(long long userKey, unsigned char digits[20]) {
-    unsigned long long k = userKey < 0 ? 0ULL - (unsigned long long)userKey
-                                       : (unsigned long long)userKey;
-    unsigned char tmp[20];
-    size_t n = 0;
-
-    do {
-        tmp[n++] = k % 10;
-        k /= 10;
-    } while (k);
-
-    for (size_t i = 0; i < n; i++) digits[i] = tmp[n - 1 - i];
-    return n;
 }
 
 void checkOverflow(void) {
